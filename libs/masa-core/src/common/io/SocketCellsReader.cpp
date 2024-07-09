@@ -30,10 +30,12 @@
 #include <errno.h>
 #include <netdb.h> //hostent
 
-SocketCellsReader::SocketCellsReader(string hostname, int port) {
+SocketCellsReader::SocketCellsReader(string hostname, int port, string shared_path) {
     this->hostname = hostname;
     this->port = port;
     this->socketfd = -1;
+    this->failure_signal_path = shared_path+"/failure.txt";
+    removeOldFiles();
     init();
 }
 
@@ -41,7 +43,12 @@ SocketCellsReader::~SocketCellsReader() {
 	close();
 }
 
+void SocketCellsReader::removeOldFiles() {
+    remove(failure_signal_path.c_str());
+}
+
 void SocketCellsReader::close() {
+    sendFinishMessage();
     fprintf(stderr, "SocketCellsReader::close(): %d\n", socketfd);
     if (socketfd != -1) {
         ::close(socketfd);
@@ -53,16 +60,59 @@ int SocketCellsReader::getType() {
 	return INIT_WITH_CUSTOM_DATA;
 }
 
+void SocketCellsReader::failureSignal() {
+    /*This function signalizes a failure to the controller by writing a failure.txt file in the shared dir.*/
+    FILE* fd_failure;
+
+    if(access(failure_signal_path.c_str(), F_OK)!=0) { //failure file was not created
+        printf("Failure Signal Sent!\n");
+        fd_failure = fopen(failure_signal_path.c_str(), "wb");
+        //TODO: write the number of the failed GPU
+        fclose(fd_failure);
+    }
+}
+
+void SocketCellsReader::sendFinishMessage() {
+    /* This function sends a message to the previous GPU sinalizing the end of it's execution
+    *  The main goal of this is for the SCW to detect the failure after it has finished sending cells
+    * and identifying if it's indeed a failure or just the end of the execution
+    */
+    char verification[10]="finished";
+    printf("Sending finished message to the previous GPU\n");
+    send(socketfd, verification, 10, MSG_NOSIGNAL);
+}
+
 int SocketCellsReader::read(cell_t* buf, int len) {
-    int pos = 0;
+    int pos=0, tries=3;//, tentativas = 0;
+    FILE* end_exec_signal; FILE* close_socket;
+    bool signalOk;
+
     while (pos < len*sizeof(cell_t)) {
     	int ret = recv(socketfd, (void*)(((unsigned char*)buf)+pos), len*sizeof(cell_t), 0);
+
+    /* This region of the function was created in order to check the return of the recv function.
+    *  If the return is 0, it means that a package of 0 bytes has been received, which probably
+    * indicates a disconnection. If the socket was in fact closed, after some tries, the return
+    * of recv will be -1, which means for sure that the connection was closed.
+    */
+        while(ret == 0 && tries > 0) { //if amount of bytes received is zero, most likely the socket has been closed
+            ret = recv(socketfd, (void*)(((unsigned char*)buf)+pos), len*sizeof(cell_t), MSG_NOSIGNAL);
+            tries --;
+            printf("SCR: Trying %d \n", 3-tries);
+            sleep(2);
+        } 
+        if (tries == 0) {
+            printf("~~~~Connection Lost!~~~~\n");
+            ::close(socketfd);
+            failureSignal();
+            break;
+        }
         if (ret == -1) {
-        	close();
+        	::close(socketfd);
             fprintf(stderr, "recv: Socket error -1\n");
             break;
         }
-        pos += ret;
+        pos += ret; 
     }
     return pos/sizeof(cell_t);
 }
@@ -76,7 +126,6 @@ int SocketCellsReader::readInt(global_score_t* score) {
 
     return ret;
 }
-
 
 void SocketCellsReader::init() {
     int rc;
@@ -97,7 +146,6 @@ void SocketCellsReader::init() {
         fprintf(stderr, "FATAL: cannot resolve hostname: %s\n", hostname.c_str());
         exit(-1);
 	}
-
     /* Construct the server address structure */
     memset(&echoServAddr, 0, sizeof(echoServAddr));     /* Zero out structure */
     echoServAddr.sin_family      = AF_INET;             /* Internet address family */
@@ -105,7 +153,7 @@ void SocketCellsReader::init() {
     echoServAddr.sin_port        = htons(port); /* Server port */
 
     /* Establish the connection to the echo server */
-    int max_retries = 3000;
+    int max_retries = 1500;
     int retries = 0;
     int ok = 0;
     fprintf(stderr, "Listening on %s %d\n", hostname.c_str(), port);
@@ -123,6 +171,7 @@ void SocketCellsReader::init() {
 	}
 	if (!ok) {
 		fprintf(stderr, "ERROR connecting to Server. Aborting\n");
+        failureSignal();
 		exit(-1);
 	}
     fprintf(stderr, "Connected to Server %s\n", inet_ntoa(echoServAddr.sin_addr));

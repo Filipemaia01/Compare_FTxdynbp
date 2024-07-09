@@ -28,7 +28,7 @@ using namespace std;
 
 class URLCellsReader: public CellsReader {
 public:
-	URLCellsReader(string url);
+	URLCellsReader(string url, string shared_path);
 	virtual ~URLCellsReader();
 	virtual void close();
 

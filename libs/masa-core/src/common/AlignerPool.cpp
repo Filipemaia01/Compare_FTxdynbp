@@ -113,7 +113,6 @@ int AlignerPool::receiveBestScoreDyn() {
         string filename = getMsgFile("scoredyn", leftdyn);
         //printf (" \n\n !!! rightdyn: %d - filename: %s  !!! \n\n", leftdyn, filename.c_str());
         waitSignal(filename);
-
         FILE* file = fopen(filename.c_str(), "rt");
         fscanf(file, "%d\n", &score);
         fclose(file);
@@ -257,7 +256,7 @@ void AlignerPool::waitSignal(string msgFile) {
 	bool signalOk = false;
 	while (!signalOk) {
 		if (count % 1000 == 0) {
-			//printf("[%d] Waiting Signal for msg: %s\n", getpid(), msgFile.c_str());
+			fprintf(stderr,"[%d] Waiting Signal for msg: %s\n", getpid(), msgFile.c_str());
 		}
 		signalOk = peekSignal(msgFile);
 		if (!signalOk) {

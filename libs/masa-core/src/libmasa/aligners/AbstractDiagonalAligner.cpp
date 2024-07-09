@@ -40,6 +40,7 @@
 
 extern int dynamic;
 extern int splitstep;
+extern int lastgpu;
 extern string wdir;
 extern FILE * dbdyn;
 extern int lastit;
@@ -80,12 +81,13 @@ void AbstractDiagonalAligner::alignPartition(Partition partition) {
 	}
 	finalizeIterations();
          if (dynamic != 0)
+		 /*
           if ((splitstep%dynamic == 0) && (lastit)) {
             string filename = wdir + "/dynend.txt";
             dbdyn = fopen(filename.c_str(),"wt");
             fprintf(dbdyn,"%d",currentExternalDiagonal );
             fclose (dbdyn); 
-        } 
+        }*/
 
 	if (DEBUG) printf("End of alignPartition: %d %d\n", hasMoreIterations(), mustContinue());
 	//destroyDispatcherQueue();
@@ -183,7 +185,7 @@ void AbstractDiagonalAligner::processNextIteration() {
 	currentExternalDiagonal++;
 
         if (dynamic != 0)
-          if ((splitstep%dynamic == 0) && (lastit) && (currentExternalDiagonal >  READ*externalDiagonalCount) && (!flagfile)) {
+          if ((lastgpu) && (lastit) && (currentExternalDiagonal >  READ*externalDiagonalCount) && (!flagfile)) {
             string filename = wdir + "/dynread.txt";
             dbdyn = fopen(filename.c_str(),"wt");
             fprintf(dbdyn,"%d",currentExternalDiagonal );

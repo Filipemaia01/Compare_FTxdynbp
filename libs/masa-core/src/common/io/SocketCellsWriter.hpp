@@ -28,7 +28,7 @@ using namespace std;
 
 class SocketCellsWriter: public CellsWriter {
 public:
-	SocketCellsWriter(string hostname, int port);
+	SocketCellsWriter(string hostname, int port, string shared_path);
 	virtual ~SocketCellsWriter();
 	virtual void close();
 
@@ -36,10 +36,14 @@ public:
 	virtual int writeInt(global_score_t* score);
 private:
     string hostname;
+	string failure_signal_path;
     int port;
     int socketfd;
 
     void init();
+	int isopen(int socket);
+	void waitForFinishMessage();
+	void failureSignal();
 };
 
 #endif /* SOCKETCELLSWRITER_HPP_ */

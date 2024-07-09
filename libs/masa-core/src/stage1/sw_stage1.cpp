@@ -68,6 +68,7 @@ static BlocksFile* blocksFile;
 extern int BestGlobal;
 extern int dynamic;
 extern int lastit;
+extern int lastgpu;
 extern string wdir;
 extern FILE * dbabp;
 extern FILE * dbbpd;
@@ -182,17 +183,25 @@ static void getBorderCells(Job* job, SpecialRowsPartition* sraPartition,
 //		firstRow->seek(job->getSequence(1)->getTrimStart() - job->getSequence(1)->getModifiers()->getTrimStart());
 //	}
 
+	string shared_path = job->getSharedPath();
+
 	if (job->flush_column_url.size() > 0) {
-		CellsWriter* writer = new URLCellsWriter(job->flush_column_url);
+		CellsWriter* writer = new URLCellsWriter(job->flush_column_url, shared_path);
 		BufferedCellsWriter* tmp = new BufferedCellsWriter(writer, job->getBufferLimit());
 		tmp->setLogFile(job->outputBufferLogFile, 10.0f);
 		lastColumn = tmp;
+	}
+	else{
+		//printf("#### @F: LAST GPU! ####\n");
+		lastgpu=1;
 	}
 
 	if (job->load_column_url.size() > 0) {
 		if (firstColumn != NULL) delete firstColumn;
 
-		CellsReader* reader = new URLCellsReader(job->load_column_url);
+		int id0 = job->getAlignmentParams()->getSequence(1)->getTrimStart()-1;
+
+		CellsReader* reader = new URLCellsReader(job->load_column_url, shared_path);
 		int limit = job->getBufferLimit();
 		if (job->getPoolWaitId() >= 0) {
 			limit = job->getSequence(0)->getLen();
@@ -312,6 +321,7 @@ int stage1(Job* job) {
 	FILE* stats = job->fopenStatistics(STAGE_1, 0);
 	job->getAlignmentParams()->printParams(stats);
 	fflush(stats);
+	lastgpu = 0;
 
        string dir;
        string filename;
@@ -347,14 +357,11 @@ int stage1(Job* job) {
     	    pthread_create(&thr, NULL, shareScore, (void *) NULL);
         }
     }
-
 	Sequence* seq_vertical = new Sequence(job->getAlignmentParams()->getSequence(0));
 	Sequence* seq_horizontal = new Sequence(job->getAlignmentParams()->getSequence(1));
-
 	aligner = job->aligner;
 	const score_params_t* score_params = aligner->getScoreParameters();
 	AlignerManager* sw = new AlignerManager(aligner);
-
 	if (job->split == 1)
 		sw->setmustSplit(true);
 
@@ -368,7 +375,6 @@ int stage1(Job* job) {
 	int ev_end = timer.createEvent("END");
 	
 	timer.init();
-
 //	int i0 = seq_vertical->getModifiers()->getTrimStart()-1;
 //	int i1 = seq_vertical->getModifiers()->getTrimEnd();
 //	int j0 = seq_horizontal->getModifiers()->getTrimStart()-1;
@@ -378,10 +384,8 @@ int stage1(Job* job) {
 	int ii1 = seq_vertical->getModifiers()->getTrimEnd();
 	int jj0 = seq_horizontal->getModifiers()->getTrimStart()-1;
 	int jj1 = seq_horizontal->getModifiers()->getTrimEnd();
-
 	Partition superPartition = Partition(ii0, jj0, ii1, jj1);
 	sw->setSuperPartition(superPartition);
-
 	int i0 = seq_vertical->getTrimStart()-1;
 	int i1 = seq_vertical->getTrimEnd();
 	int j0 = seq_horizontal->getTrimStart()-1;
@@ -428,9 +432,7 @@ int stage1(Job* job) {
 
 
 	score_t minScore = getInitialBestScore(job->alignment_start, job->alignment_end);
-
 	bestScoreList = new BestScoreList(job->max_alignments, minScore.score, seq0_len, seq1_len, score_params);
-
 	status = new Status(job->getWorkPath(), bestScoreList);
 	if (!status->isEmpty()) {
 		//bestScore = bestScoreList->getBestScore();
@@ -523,26 +525,11 @@ int stage1(Job* job) {
        //fflush(dbsta);
        //fclose(dbsta);
     }
-    
-    if (dynamic != 0) {
-            string filenamedyn = wdir + "/dynend.txt";
-            dbdyn = fopen(filenamedyn.c_str(),"wt");
-            fprintf(dbdyn,"END");
-            fclose (dbdyn);
-    }
-
 
 	if (blocksFile != NULL) {
 		blocksFile->close();
 		delete blocksFile;
 		blocksFile = NULL;
-	}
-	//	if (firstColumn != NULL) {
-	//		delete firstColumn;
-	//	}
-	printf(">>>>> Deleting lastColumn: %p\n", lastColumn);
-	if (lastColumn != NULL) {
-		delete lastColumn;
 	}
 
 	if (job->getAlignerPool() != NULL) {
@@ -559,6 +546,7 @@ int stage1(Job* job) {
 		job->bestglobalscore.j = best_score.j;
 		job->bestglobalscore.node = job->node;
 	}
+
 
 	fprintf(stats, "======= Execution Status =======\n");
 	fprintf(stats, "   Best Score: %d\n", best_score.score);
@@ -611,6 +599,33 @@ int stage1(Job* job) {
 		crosspointsFile->close();
 		delete crosspointsFile;
 
+		if (lastgpu && dynamic != 0) {
+            string filenamedyn = wdir + "/dynend.txt";
+            dbdyn = fopen(filenamedyn.c_str(),"wt");
+            fprintf(dbdyn,"END");
+            fclose (dbdyn);
+    	}
+
+		if (firstColumn != NULL) {
+			fprintf(stderr, ">>>>> Deleting firstColumn: %p\n", firstColumn);
+			delete firstColumn;
+		}
+
+		if (lastColumn != NULL) {
+			fprintf(stderr, ">>>>> Deleting lastColumn: %p\n", lastColumn);
+			delete lastColumn;
+		}
+
+		if (lastgpu && dynamic != 0) {
+			/*writes dynend for the second time to detect failure between the first and last
+			* Column deletion (check controller's finish confirmation function for more info)
+			*/
+            string filenamedyn = wdir + "/dynend1.txt";
+            dbdyn = fopen(filenamedyn.c_str(),"wt");
+            fprintf(dbdyn,"END");
+            fclose (dbdyn);
+    	}
+
 		return 1;
 	} else {
 		int count = 0;
@@ -623,6 +638,33 @@ int stage1(Job* job) {
 			crosspointsFile->close();
 			delete crosspointsFile;
 		}
+
+		if (lastgpu && dynamic != 0) {
+            string filenamedyn = wdir + "/dynend.txt";
+            dbdyn = fopen(filenamedyn.c_str(),"wt");
+            fprintf(dbdyn,"END");
+            fclose (dbdyn);
+    	}
+
+		if (firstColumn != NULL) {
+			fprintf(stderr, ">>>>> Deleting firstColumn: %p\n", firstColumn);
+			delete firstColumn;
+		}
+
+		if (lastColumn != NULL) {
+			fprintf(stderr, ">>>>> Deleting lastColumn: %p\n", lastColumn);
+			delete lastColumn;
+		}
+
+		if (lastgpu && dynamic != 0) {
+			/*writes dynend for the second time to detect failure between the first and last
+			* Column deletion (check controller's finish confirmation function for more info)
+			*/
+            string filenamedyn = wdir + "/dynend1.txt";
+            dbdyn = fopen(filenamedyn.c_str(),"wt");
+            fprintf(dbdyn,"END");
+            fclose (dbdyn);
+    	}
 
 		return count;
 	}

@@ -6,13 +6,15 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
-#include <bits/stdc++.h> 
+#include <bits/stdc++.h>
 // #include <seqan/alignment_free.h>
 
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector> 
 #include <fstream>
 
 using namespace std;
@@ -43,7 +45,13 @@ using namespace std;
 #define DEBUG 0
 #define LIMIT 2
 
-
+typedef struct {
+	int h;
+	union {
+		int f;
+		int e;
+	};
+} __attribute__ ((aligned (8))) cell_t;
 
 struct config_struct {
     int gpus;
@@ -70,6 +78,19 @@ int socketfdwrite;
 int dyn;
 int comma; 
 int gflops = 0;
+char failure_path[200];
+int part;
+int split_total=0;
+int vgpu;
+/* To execute this controller version, the user must:
+* 1) Fill the controller's IP in myIP.
+* 2) The username of all machines must be the same, have the same ID and filled in the username variable.
+* The machines must also have the same group ID, so that the NFS will allow all permissions.
+* 3) The path from the root to the FT-dynBP must be the same in all machines and filled in the path variable,
+* located in the restartbalancers function
+*/
+char myIP[15] = "192.168.0.88";
+char username[30] = "laicoadm";
 
 int read_int_from_config_line(char* config_line) {
     char prm_name[MAX_CONFIG_VARIABLE_LEN];
@@ -77,7 +98,6 @@ int read_int_from_config_line(char* config_line) {
     sscanf(config_line, "%s %d\n", prm_name, &val);
     return val;
 }
-
 
 void read_str_from_config_line(char* config_line, int op) {
 
@@ -119,7 +139,6 @@ void read_str_from_config_line(char* config_line, int op) {
               config.split[t]=1;
     }
 }
-
 
 int read_config_file(char* config_filename) {
     FILE *fp;
@@ -199,31 +218,106 @@ int read_config_file(char* config_filename) {
     return EXIT_SUCCESS;
 }
 
-int connect_agents () {
+void update_split (int vgpu) {
+    /* This function takes the sum of all splits from the first breakpoint and
+    * divide it as even as possible among the remaining GPU (in case of failure).
+    */
+    int k=1, j, split_fail, remainder=0;
+
+    split_fail = split_total/config.gpus;
+    remainder = split_total%config.gpus;
+
+    for(j=part; j<vgpu; j++) {
+        if(k<=remainder) { //If the division is not exact, then the reamining is redistributed among the first GPUs
+            splitnew[j] = split_fail+1;
+        }
+        else {
+            splitnew[j] = split_fail;
+        }
+        k++; //k keeps track of the amount of splits that must be +1 in order for the remainder to be equally distributed.
+        if(k==config.gpus) {k=1;}
+    }
+}
+
+void update_config_info(int* i, int kk, int *vgpu) {
+    /* This function updates the GPUs info in case a GPU does not come back from failure
+    * It also updates vgpu, which represents the total number of parts to be executed.
+    */
+    int j;
+
+    printf("Could not connect to server %s\n", config.ips[*i]);
+    for(j=*i; j<config.gpus-1; j++) {
+        config.sock[j] = config.sock[j+1];
+        strcpy(config.ips[j], config.ips[j+1]);
+        config.ctrlport [j] = config.ctrlport[j+1];
+        strcpy(config.ports[j], config.ports[j+1]);
+        config.gpu_number[j] = config.gpu_number[j+1];
+    }
+    dyn--;
+    config.gpus--;
+    *vgpu = part + (config.breakpoints+1-kk)*config.gpus;
+    update_split(*vgpu);
+    *i = *i-1;
+}
+
+int connect_agents (int kk, int* vgpu) {
+    /*This function tries to connect to every GPU on the configuration file. If it does not connect until timout,
+    * it is assumed that it is not going to comeback and so the GPU info must be update to delete the failed GPU
+    */
 
 	struct sockaddr_in agent_addr;
+    int i, j, max_retries=3, retries=0, ok=0;
 
-        printf("\n ### Controller: connecting balancers... \n");
+    printf("\n ### Controller: connecting balancers... \n");
 
-	for (int i=0; i<config.gpus; i++) {
-	        config.ctrlport[i] = BASEPORT + config.gpu_number[i];
-	        if ((config.sock[i] = socket(PF_INET, SOCK_STREAM, 0)) < 0) {
-	          printf("\n Socket creation error \n");
-	          return ERROR;
-	        }
-	        memset(&agent_addr, '0', sizeof(agent_addr));
-	        agent_addr.sin_family = AF_INET;
-                agent_addr.sin_port = htons(config.ctrlport[i]);
-	        if(inet_pton(PF_INET, config.ips[i], &agent_addr.sin_addr)<=0) {
-	          printf("\nInvalid address/ Address not supported \n");
-	          return ERROR;
-	        }
-	        if (connect(config.sock[i], (struct sockaddr *)&agent_addr, sizeof(agent_addr)) < 0) {
-	          printf("\nConnection Failed: %d - %s - %d \n", i, config.ips[i], config.ctrlport[i]);
-	          return ERROR;
-	        }
-	 }
+
+    for (i=0; i<config.gpus; i++) {
+        config.ctrlport[i] = BASEPORT + config.gpu_number[i];
+        if ((config.sock[i] = socket(PF_INET, SOCK_STREAM, 0)) < 0) {
+            printf("\n Socket creation error \n");
+            return ERROR;
+        }
+    }
+
+    for (i=0; i<config.gpus; i++) {
+        memset(&agent_addr, '0', sizeof(agent_addr));
+        agent_addr.sin_family = AF_INET;
+        agent_addr.sin_port = htons(config.ctrlport[i]);
+        if(inet_pton(PF_INET, config.ips[i], &agent_addr.sin_addr)<=0) {
+            printf("\nInvalid address/ Address not supported \n");
+            return ERROR;
+        }
+
+        while(retries < max_retries && !ok) {
+            printf("ip: %s\n", config.ips[i]);
+            if (connect(config.sock[i], (struct sockaddr *)&agent_addr, sizeof(agent_addr)) < 0) {
+                retries++;
+ 			    fprintf(stderr, "ERROR connecting to Server %s [Retry %d/%d]. %s\n", config.ips[i], retries, max_retries, strerror(errno));
+			    sleep(3);
+            }
+            else {
+                ok = 1;
+                printf("Connected to server %s\n", config.ips[i]);
+            }
+        }        
+        if (!ok) {
+            update_config_info(&i, kk, vgpu);
+        }
+        retries = 0;
+        ok = 0;
+	}
+    printf("Amount of connected gpus: %d\n", config.gpus);
+
    return EXIT_SUCCESS;
+}
+
+void close_agents () {
+    int i;
+
+    for(i=0; i<config.gpus; i++) {
+        close(config.sock[i]);
+    }
+    close(socketfdwrite);
 }
 
 void rebalance (int start) {
@@ -323,7 +417,297 @@ float readlastline(string filename)
 
 }
 
+void closeterminals() {
+    int i;
+    char close_terminals[50];
 
+    for(i=0; i<config.gpus; i++) {
+        if(strcmp(config.ips[i],myIP)){
+            strcpy(close_terminals, "pkill -xf 'ssh laicoadm@");
+            strcat(close_terminals, config.ips[i]);
+            strcat(close_terminals, "'");
+
+            printf("Close terminals comand: %s\n", close_terminals);
+            system(close_terminals);
+            strcpy(close_terminals, "");
+        }
+    }
+    strcpy(close_terminals, "pkill bash");
+    printf("Last close terminals command: %s\n", close_terminals);
+    system(close_terminals);
+}
+
+void killprocess(char process[]) {
+    /*This function kills a process sent in the parameters. It is currently used to kill both
+    * CUDAlign and balancers on each GPU connected.
+    */
+    int i;
+    char kill_comand[100]; //TODO: identify this GPU's IP and hostname of each GPU
+
+    for (i=0; i<config.gpus; i++) {
+        if (strcmp(config.ips[i], myIP)) { //Not my IP
+            strcpy(kill_comand, "ssh ");
+            strcat(kill_comand, username);
+            strcat(kill_comand, "@");
+            strcat(kill_comand, config.ips[i]);
+            strcat(kill_comand, " pkill "); // pkill kills a process based on it's name
+            strcat(kill_comand, process);
+            //strcat(kill_comand, " &");
+        }
+        else { //My IP
+            strcpy(kill_comand, "pkill ");
+            strcat(kill_comand, process);
+        }
+        
+        system(kill_comand);
+        //printf("@F: Kill command: %s\n", kill_comand);
+        strcpy(kill_comand, "");
+    }
+}
+
+void restartbalancers(char workdir[]) {
+    /*This function restart all balancers connected to the controller.
+    * After a failure, all balancers are killed and then restarted so the execution returns
+    * from the last complete breakpoint and finishes automatically.
+    */
+    char balancers_command[300]="", str_number[20], ignoreip[15] = "192.168.0.158";
+    char path[100]="Documentos/Filipe/FT-dynBP";
+    int i;
+
+    for(i=0; i<config.gpus; i++) {
+        sprintf(str_number, "%d", config.gpu_number[i]);
+        if(strcmp(config.ips[i], myIP)) { //Not my ip
+            //gnome-terminal -- bash -c 'ssh laicoadm@ip "cd Documentos/Filipe/FT-dynBP;./balancer str_number workdir";exec bash'
+            strcpy(balancers_command, "gnome-terminal -- bash -c 'ssh ");
+            strcat(balancers_command, username);
+            strcat(balancers_command, "@");
+            strcat(balancers_command, config.ips[i]);
+            strcat(balancers_command, " \"cd ");
+            strcat(balancers_command, path);
+            strcat(balancers_command, ";./balancer ");
+            strcat(balancers_command, str_number);
+            strcat(balancers_command, " ");
+            strcat(balancers_command, workdir);
+            strcat(balancers_command, "\";exec bash'");
+        }
+        else { //My ip
+            //gnome-terminal --tab -- sh -c "./balancer 0 ../dirs_MASA; bash"
+            strcat(balancers_command, "gnome-terminal -- sh -c \"./balancer ");
+            strcat(balancers_command, str_number);
+            strcat(balancers_command, " ");
+            strcat(balancers_command, workdir);
+            strcat(balancers_command, "; bash\"");
+        }
+        //if(strcmp(config.ips[i], ignoreip)) {
+            system(balancers_command);
+            //printf("@F: Balancers command: %s\n", balancers_command);
+        //}
+        strcpy(balancers_command, "");
+    }
+}
+
+int detectfailure() {
+    /*This function waits until either CUDAlign identifies a failure and writes a file signalizing it or 
+    * the balancer sends a message (READ or END) confirming that CUDAlign reached a certain point of
+    * execution (80% or 100%).
+    */
+    int qtd_bytes=0, ret_access=-1, valread=0;
+    char recmessage[10] = {0};
+
+    while (qtd_bytes == 0 && ret_access!=0) { //BW until the failure file is created or balancer sends a signal
+        ioctl(socketfdwrite, FIONREAD, &qtd_bytes);
+        ret_access = access(failure_path, F_OK);
+        usleep(100);
+    }
+
+    if(ret_access==0) {
+        printf("\n ### Failure detected! ###\n");
+        return 1;
+    }
+    else {
+        memset(recmessage, 0, sizeof(recmessage));
+        valread = read(socketfdwrite, recmessage, 4);
+        printf ("\n ### Controller: balancer message received: %d - %s.\n\n", valread, recmessage);
+        return 0;
+    }
+}
+
+int isBkptValid (char breakpoint_path[], char sequence_path[]) {
+    /*This function checks which of the two last breakpoints is valid.
+    * To do this, it compares the vertical sequence and breakpoint sizes.
+    * Of course, the breakpoint contains cells as the sequence contains characters,
+    * so in order to compare the amount of cells processed, the breakpoint size must
+    * be divided by the cell size.
+    */
+
+    FILE* breakpoint;
+    FILE* vertical_sequence;
+    long int breakpoint_size=0, sequence_size=0;
+    char i, line[500];
+
+    printf("Checking breakpoint %s\n", breakpoint_path);
+    //get breakpoint size ####################################################
+    if (strcmp(breakpoint_path, "unavailable")==0) {
+        return 0;
+    }
+    breakpoint = fopen(breakpoint_path, "rb");
+    if (breakpoint == NULL) {
+        fprintf(stderr, "Failed to open config file %s\n", breakpoint_path);
+        return 0;
+    }
+
+    fseek(breakpoint, 0, SEEK_END);
+    breakpoint_size = ftell(breakpoint);
+    breakpoint_size = breakpoint_size/sizeof(cell_t);
+
+    fclose(breakpoint);
+    printf("Breakpoint Size = %ld\n", breakpoint_size);
+
+    //get sequence size #######################################################
+    vertical_sequence = fopen(sequence_path, "rb");
+    if (vertical_sequence == NULL) {
+        fprintf(stderr, "Failed to open config file %s\n", sequence_path);
+        return 0;
+    }
+    fgets(line, sizeof(line), vertical_sequence);
+
+    while ((i=fgetc(vertical_sequence)) != EOF) {
+        if (i == '\r' || i == '\n' || i == ' ');
+        else{
+            sequence_size++;
+        }
+    }
+    sequence_size++;
+    fclose(vertical_sequence);
+    printf("Sequence Size = %ld\n", sequence_size);
+
+    //compare files size #######################################################
+    if(sequence_size == breakpoint_size) {
+        return 1;
+    }
+    else {
+        return 0;
+    }
+}
+
+int finishconfirmation (char workdir[], char cpart[]) {
+    /*After writing the dynend file, CUDAlign deletes it's socket and finishes saving some
+    * data structures to disk. In the meantime, failure may occur and so, to detect the failure
+    * the controller deletes the first dynend and waits for dynend1 to be created, which happens
+    * after CUDAlign finishes all of its execution. If there is a timeout, the controller assumes
+    * that a failure has occurred.
+    * The dynend1 file is created to avoid a possible deadlock. For example: if CUDAlign creates
+    * the two files before the controller has the chance to remove the first.
+    */
+    char endfile_path[200];
+    int tries=0;
+
+    strcpy(endfile_path, workdir);
+    strcat(endfile_path, "/work");
+    strcat(endfile_path, cpart);
+    strcat(endfile_path, "/dynend.txt");
+
+    if(access(endfile_path, F_OK)!=0) { //dynend was not created in the first execution
+        return 0;
+    }
+    else {
+        remove(endfile_path);
+
+        strcpy(endfile_path, "");
+        strcpy(endfile_path, workdir);
+        strcat(endfile_path, "/work");
+        strcat(endfile_path, cpart);
+        strcat(endfile_path, "/dynend1.txt");
+
+        while((access(endfile_path, F_OK)!=0) && tries < 15) { //waits for CUDAlign to recreate dynend (after destroying it's socket)
+            printf("Waiting for CUDAlign's finish confirmation. Trying: [%d/15]\n", tries);
+            sleep(2);
+            tries++;
+        }
+        if(tries == 15) {
+            printf("\n ### Failure detected! ###\n");
+            return 1;
+        }
+        return 0;
+    }
+}
+
+void recoverfromfailure(char workdir[], int kk, int*vgpu, char config_file[], int valid_part) {
+    char ctrl_path[300];
+    int i;
+    char c_part[100];
+
+    //Deleting all the directories created in the failed execution
+    for(i=1; i<=config.gpus; i++) {
+        strcpy(ctrl_path, "rm -rf ");
+        strcat(ctrl_path, workdir);
+        strcat(ctrl_path, "/work");
+        sprintf(c_part, "%d", (i+valid_part));
+        strcat(ctrl_path, c_part);
+        system(ctrl_path);
+        strcpy(ctrl_path, "");
+    }
+    
+    //dealing with the failure
+    printf("\n ### Killing all instances of CUDAlign ###\n");
+    killprocess("cudalign");
+    killprocess("balancer");
+    read_config_file(config_file);
+    //closeterminals();
+    printf("\n ### Restarting Balancers ###\n");
+    restartbalancers(workdir);
+    close_agents();
+    connect_agents(kk, vgpu);
+    remove(failure_path);
+}
+
+int definenextiteration (int* failed, int* kk, char last_breakpoints[2][200], int* valid_it, char workdir[], char cpart[], int* socketinitiated, int* valid_part, int*vgpu, char config_file[]) {
+    /*This function updates the next and the last complete iteration based on the breakpoint validation
+    * if the last bkpt failed but the previous is valid, a failure occurred and so the iteration must return
+    * to valid_it, unless it is the first iteration. If the last two breakpoint are incomplete, the controller
+    * returns an error.
+    */
+    if (!*failed) {
+        *failed = finishconfirmation(workdir, cpart);
+    }
+    if(*kk > 0 || *failed) {
+        *failed=0;
+        if(isBkptValid(last_breakpoints[1], config.seq0)){
+            *valid_it = *kk;
+            *valid_part = part;
+        }
+        else {
+            if(!isBkptValid(last_breakpoints[0], config.seq0)){
+                printf("\nBreakpoint corrupted\n");
+                if(*kk<2) {
+                    printf("Restarting First Iteration\n");
+                    *kk=0;
+                    *valid_it = 0;
+                    part = 0;
+                    *valid_part = 0;
+                    recoverfromfailure(workdir, *kk, vgpu, config_file, *valid_part);
+                    *socketinitiated = 0;
+                }
+                else{
+                    printf("Finishing execution\n");
+                    return 0;
+                }
+            }
+            else {
+                printf("\nBreakpoint Corrupted. Returning to previous breakpoint\n");
+                *kk=*valid_it;
+                part = *valid_part;
+                strcpy(last_breakpoints[1], "");
+                strcpy(last_breakpoints[1], last_breakpoints[0]);
+                strcpy(last_breakpoints[0], "");
+                strcpy(last_breakpoints[0], "unavailable");
+                recoverfromfailure(workdir, *kk, vgpu, config_file, *valid_part);
+                *socketinitiated = 0;
+            }
+        }
+    }
+    return 1;
+}
 
 void initSocketWrite() {
      int rc;
@@ -389,24 +773,37 @@ void initSocketWrite() {
      socketfdwrite = clntSock;
  }
 
-
 int main(int argc, char *argv[]) {
 
     std::ostringstream ss, ss2;
     struct timeval start, end;
 
     int ret;
-    int vgpu;
+    int qtd_bytes=0, ret_access=-1;
     long long int sum = 0;
     long long int sumcheck = 0;
-    int part;
+    int valid_part = 1;
+    part = 0;
     int valread = 0;
+    int valid_it = 0, failed=0, exec_finished=0;
+    int kk = 0;
 
+    string filename;
     string command;
     string deccom;
 
+    char last_breakpoints[2][200]; //first element stores the previous bkpt name. Second element stores the latest bkpt name.
+    char cpart[100];
+    char config_file[100];
+
     char WORKDIR[100];
     strcpy (WORKDIR,argv[2]);
+
+    strcpy(failure_path, WORKDIR);
+    strcat(failure_path, "/share/failure.txt");
+    strcpy(last_breakpoints[0], "unavailable");
+    strcpy(last_breakpoints[1], "unavailable");
+    strcpy(config_file, argv[1]);
 
     char recmessage[10] = {0};
 
@@ -444,14 +841,15 @@ int main(int argc, char *argv[]) {
        }    
     }
 
+    // Connect balancer sockets
+    if (connect_agents (0, &vgpu) < 0) {
+    	//return ERROR;
+        printf ("### Controller: socket connection error \n");
+        return ERROR;
+    }
+
     vgpu = config.gpus*(config.breakpoints+1);
 
-    // Connect balancer sockets
-    if (connect_agents () < 0) {
-    	//return ERROR;
-        printf ("### Controller: sockect connection error \n");
-        return ERROR;
-    }   
     // initial weigth distribution: even
     for (int j=0; j< vgpu; j++) {
         if (config.gpus < 16)
@@ -470,6 +868,9 @@ int main(int argc, char *argv[]) {
     for (int i=0; i<=config.breakpoints;i++) 
       rebalance(i*config.gpus);
 
+    for (int i=0; i<config.gpus;i++) {
+       split_total += splitnew[i];
+    }
     //initSocketWrite();
     int socketinitiated = 0;
     
@@ -479,9 +880,13 @@ int main(int argc, char *argv[]) {
     int i;
 
     // send initial command execution
-    for (int kk=0; kk<=config.breakpoints; kk++) {
+    for (kk=0; kk<=config.breakpoints; kk++) {
+        if(!definenextiteration(&failed, &kk, last_breakpoints, &valid_it, WORKDIR, cpart, &socketinitiated, &valid_part, &vgpu, config_file)){
+            return 0;
+        }
        for (i=0; i<config.gpus;i++) {
-    	  part = kk*config.gpus + i + 1;
+          part++; 
+    	  //part = kk*config.gpus + i + 1;
           //command.str("");
           command.clear();
     	  command = "EXEC|./cudalign --blocks=512 --clear --no-flush --stage-1 --shared-dir=";
@@ -525,9 +930,7 @@ int main(int argc, char *argv[]) {
     	  ss.str("");
     	  ss.clear();
     	  if (part != 1) {
-    	     int x;
-    	     x = (part-2)%config.gpus;
-    	     if (part%config.gpus == 1) {
+    	     if (i==0) { //First GPU
                 command = command + " --load-column=file://";
                 ss.str("");
                 ss.clear();
@@ -539,8 +942,8 @@ int main(int argc, char *argv[]) {
                 command = command + ss.str() + ".bin";
              }
     	     else {
-                ss <<  config.ports[x];
-      	        command = command + " --load-column=socket://" + config.ips[x] + ":" + ss.str();
+                ss <<  config.ports[i-1];
+      	        command = command + " --load-column=socket://" + config.ips[i-1] + ":" + ss.str();
                 // int po = atoi(config.ports[x]) + 100;
                 // ss.str("");
                 // ss.clear();
@@ -553,7 +956,7 @@ int main(int argc, char *argv[]) {
     	  ss.str("");
     	  ss.clear();
     	  if (part != vgpu) {
-    	      if (part%config.gpus == 0) {
+    	      if (i==config.gpus-1) { //Last GPU
                   command = command + " --flush-column=file://";
                   ss.str("");
                   ss.clear();
@@ -564,12 +967,25 @@ int main(int argc, char *argv[]) {
                   ss << part;
                   command = command + ss.str() + ".bin";
 
+                  //updating last bkpt
+                  strcpy(last_breakpoints[0], "");
+                  strcpy(last_breakpoints[0], last_breakpoints[1]);
+                  strcpy(last_breakpoints[1], WORKDIR);
+                  strcat(last_breakpoints[1], "/share/out");
+                  sprintf(cpart, "%d", part);
+                  strcat(last_breakpoints[1], cpart);
+                  strcat(last_breakpoints[1], ".bin");
               }
     	      else {
                  ss <<  config.ports[i];
-      	         command = command + " --flush-column=socket://" + config.ips[i] + ":" + ss.str();
+      	         command = command + " --flush-column=socket://" + config.ips[i+1] + ":" + ss.str();
              }
     	  }
+          else { //pseudo breakpoint from last iteration. It is here just to detect failure on last iteration.
+            strcpy(last_breakpoints[0], "");
+            strcpy(last_breakpoints[0], last_breakpoints[1]);
+            strcpy(last_breakpoints[1], "unavailable");
+          }
     	
     	  ss.str("");
     	  ss.clear();
@@ -587,7 +1003,7 @@ int main(int argc, char *argv[]) {
     	  command.copy(com,command.size()+1);
     	  com[command.size()] = '\0';
     	  send(config.sock[i], com, strlen(com), 0);
-          printf( "\n ### Controller: exec message sent to GPU %d \n", i); 
+          printf( "\n ### Controller: exec message sent to GPU %d \n", i);
        }	
        
       if (!socketinitiated) {
@@ -598,7 +1014,6 @@ int main(int argc, char *argv[]) {
 
       // Loop for the number of breakpoints
       if (kk<config.breakpoints) {
-          string filename;
           ss2.str("");
           ss2.clear();
           ss2 << WORKDIR;
@@ -608,7 +1023,7 @@ int main(int argc, char *argv[]) {
     	  ss2 << part;
     	  filename = filename + ss2.str() + "/dyn.txt";
     	  FILE * fp = NULL;
-
+      }
     	  /* // send READ command to balancer start read thread
     	  if ((part % config.gpus) == 0 && (part != vgpu)) {
     		  ss2.str("");
@@ -620,21 +1035,19 @@ int main(int argc, char *argv[]) {
 
     	                
           // wait for socket message from balancer which indicates performance counters can be read
-    	  printf ("\n ### Controller: waiting for balancer READ message. \n");
+      printf ("\n ### Controller: waiting for balancer READ message. \n");
 
-    	  //while (valread ==0) {
-              memset(recmessage, 0, sizeof(recmessage));
-              valread = read(socketfdwrite, recmessage, 4);
-          // }
-                    
-          
-    	  printf ("\n ### Controller: balancer message received: %d - %s.\n\n", valread, recmessage);
-          memset(recmessage, 0, sizeof(recmessage));
-          valread=0;
+      if(detectfailure()){
+          //recoverfromfailure(WORKDIR, cpart);
+          failed=1;
+          socketinitiated = 0;
+          kk--;
+          continue;
+      }
 
           //for (int kkk=0;kkk<config.gpus*(config.breakpoints+1);kkk++)
           //   printf ("Original: splitnew[%d]:  %d \n", kkk, splitnew[kkk]);
-
+      if (kk<config.breakpoints) {
           int unbalanced = 0;
           char op2;
           if (strcmp(config.model,"decision") == 0) {
@@ -665,7 +1078,7 @@ int main(int argc, char *argv[]) {
 
 
           if (!unbalanced)
-   	  // read last line of performance log files
+   	         // read last line of performance log files
     	     for (int jj=0; jj<config.gpus; jj++) { 
                 ss2.str("");
                 ss2.clear();
@@ -695,10 +1108,9 @@ int main(int argc, char *argv[]) {
           else
               unbalanced = 1; 
     	  }
-    	  for (int kkk=0;kkk<config.gpus*(config.breakpoints+1);kkk++)
+    	  for (int kkk=0;kkk<vgpu;kkk++)
              printf ("Before rebalance: splitnew[%d]:  %d \n", kkk, splitnew[kkk]);
           // printf("part: %d \n", part);
-
           // rebalance weights based on current counters
           if (unbalanced)
              for (int kkk=0;kkk<config.gpus;kkk++)
@@ -709,52 +1121,26 @@ int main(int argc, char *argv[]) {
           //FILE * fpr;
           //fpr = fopen ("rebalance.txt","at");
  
-          for (int kkk=0;kkk<config.gpus*(config.breakpoints+1);kkk++)
+          for (int kkk=0;kkk<vgpu;kkk++)
              fprintf (fpr, "After rebalance: splitnew[%d]:  %d \n", kkk, splitnew[kkk]);
 
-          fclose(fpr);
 
+          fclose(fpr);
+      }
           // wait for socket message from balancer which indicates last GPU finished its job
           printf ("\n ### Controller: waiting for balancer END message. \n");
 
-          while (valread ==0) {
-             memset(recmessage, 0, sizeof(recmessage));
-             valread = read(socketfdwrite, recmessage, 4);
+          if(detectfailure()){
+            //recoverfromfailure(WORKDIR, cpart);
+            failed=1;
+            socketinitiated = 0;
+            kk--;
+            continue;
           }
-          printf ("\n ### Controller: balancer message received: %s.\n\n", recmessage);
-
           //sleep(10);
-
-        }
      }
 
-     
-
-    // wait for socket message from balancer which indicates last GPU finished its job
-    printf ("\n ### Controller: waiting for balancer READ message. \n");
-    valread=0;
-    while (valread ==0) {
-      memset(recmessage, 0, sizeof(recmessage));
-      valread = read(socketfdwrite, recmessage, 4);
-    }
-
-    printf ("\n ### Controller: balancer message received: %s.\n\n", recmessage);
-
-  
-    
-    // wait for socket message from balancer which indicates last GPU finished its job
-    printf ("\n ### Controller: waiting for balancer END message. \n");
-    valread=0;
-    while ((valread ==0) && (strcmp(recmessage,"END  ")!= 0)) {
-      memset(recmessage, 0, sizeof(recmessage));
-      valread = read(socketfdwrite, recmessage, 4);
-    }
-
-    printf ("\n ### Controller: balancer message received: %s.\n\n", recmessage);
     fflush(stdout);
-
-    
-
     close(socketfdwrite);
 
     // end timer 

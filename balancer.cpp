@@ -185,7 +185,7 @@ int resolveDNS(const char * hostname , char* ip) {
 						retries, max_retries, strerror(errno));
 			}
 			retries++;
-			usleep(1000);
+			usleep(10000);
 		} else {
 			ok = 1;
 		}
@@ -388,6 +388,7 @@ int main(int argc, char const *argv[])
     char command[CONFIG_LINE_BUFFER_SIZE] = {0};
     //char hello[CONFIG_LINE_BUFFER_SIZE] = "Hello from server";
     char new_command[CONFIG_LINE_BUFFER_SIZE];
+    char flushsocket[22] = "--flush-column=socket";
     //char car;
     std::ostringstream np;
 
@@ -553,7 +554,7 @@ int main(int argc, char const *argv[])
     	    system(new_command);
             //string filename2;
             if (DEBUG) printf ("\n\n *** numpart: %d, numgpus: %d,  mod: %d \n", numpart, numgpus, numpart%numgpus);
-            if ((numpart % numgpus) == 0) {
+            if ((strstr(new_command, flushsocket)==NULL)) { //last GPU
                np.str("");
                np.clear();
                np << numpart;
@@ -611,6 +612,7 @@ int main(int argc, char const *argv[])
     		//   pthread_cancel(thrread);
                 //if (wr)
     		//   pthread_cancel(thrwrite);
+            //sleep(20); //time to kill data structures before finishing balancer and so finishing cudalign instantiated by it
     	    return (0);
     	    break;
     	}
